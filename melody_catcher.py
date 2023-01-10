@@ -1,6 +1,5 @@
 
 import numpy as np
-import pyaudio
 import pygame
 import time
 import win32api
@@ -16,12 +15,13 @@ CHUNK = 1024 * 4
 
 FPS = 60
 
-HEIGHT_STATE = 30
-
 WIDTH = 960
-HEIGHT = HEIGHT_STATE+540
+HEIGHT_STATE = 30
+HEIGHT = HEIGHT_STATE + 540
 
-FREQ_MASK = 15
+FREQ_MASK = 20
+FREQ_TUNE = np.array([27.5000 * 2 ** (i/12) for i in range(88)])
+NOISEFLOOR = 5
 
 GRAPH_AUDIO_CY = 100
 GRAPH_AUDIO_X = 20
@@ -30,6 +30,7 @@ GRAPH_AUDIO_CX = WIDTH - GRAPH_AUDIO_X * 2
 
 PEAK_HOLD = 1
 PEAK_REALESE = 0.5
+SMOOTH = 0.1
 
 # 프로세스 레퍼런스
 HWND = None
@@ -40,20 +41,10 @@ pygame.display.set_icon(pygame.image.load("img/icon_mc.png"))
 clock = pygame.time.Clock()
 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.NOFRAME)
 
-text = []
-text.append(pygame.font.Font("font/Pretendard-Thin.otf", 15).render("Melody Catcher", True, (255,255,255)))
-text.append(pygame.font.Font("font/Pretendard-Thin.otf", 25).render("Audio signal", True, (255,255,255)))
-text.append(pygame.font.Font("font/Pretendard-Thin.otf", 25).render("Spectrogram", True, (255,255,255)))
-text.append(pygame.transform.rotate(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("20Hz", True, (255,255,255)), 315))
-text.append(pygame.transform.rotate(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("100Hz", True, (255,255,255)), 315))
-text.append(pygame.transform.rotate(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("1kHz", True, (255,255,255)), 315))
-text.append(pygame.transform.rotate(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("10kHz", True, (255,255,255)), 315))
-text.append(pygame.transform.rotate(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("20kHz", True, (255,255,255)), 315))
-text.append(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("Sample start", True, (0,255,0)))
-text.append(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("Sample end", True, (255,0,0)))
-text.append(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("Raw", True, (255,255,255)))
-text.append(pygame.font.Font("font/Pretendard-Regular.otf", 10).render("A-weighting", True, (255,255,255)))
-text.append(pygame.font.Font("font/Pretendard-Thin.otf", 25).render("Melody", True, (255,255,255)))
+# 텍스트 객체 사전 로딩
+text = {}
+text["Melody_Catcher_title"] = pygame.font.Font("font/Pretendard-Regular.otf", 15).render("Melody Catcher", True, (255,255,255))
+text["Audio_Signal"] = pygame.font.Font("font/Pretendard-Thin.otf", 25).render("Audio Signal", True, (255,255,255))
 
 
 win_x = None
@@ -72,9 +63,14 @@ from audio_importer import audio_importer
 importer = audio_importer(RATE, FPS, CHUNK)
 
 draw_audio_x = [GRAPH_AUDIO_X+int(np.round(GRAPH_AUDIO_CX*i/CHUNK)) for i in range(CHUNK)]
+draw_fft_x = [50 + int(np.round(np.log10(i + 1) / np.log10(RATE//2) * (WIDTH - 100))) for i in range(RATE//2)]
+draw_tune_x = draw_fft_x[FREQ_MASK + 1 : 4000]
+draw_tune_line_x = [(draw_fft_x[int(np.floor(FREQ_TUNE[i]))] + draw_fft_x[int(np.ceil(FREQ_TUNE[i]))]) / 2 for i in range(88)]
 
-peak = 0
-peak_fresh = 0
+tune_data_list = np.array([np.array([0] * (4000 - FREQ_MASK), dtype=np.float64) for _ in range(int(np.round(SMOOTH * FPS)))])
+
+peak = 1
+peak_fresh = time.time()
 
 pygame.display.flip()
 
@@ -92,8 +88,9 @@ while not eventKey_quit:
 
     clock.tick(FPS)
 
-    # 이벤트 불러오기
     mouse = win32api.GetCursorPos()
+
+    # 이벤트 검사
     for event in pygame.event.get():
 
         if event.type == pygame.QUIT:
@@ -143,7 +140,7 @@ while not eventKey_quit:
         win32gui.SetWindowPos(HWND, 0, win_x+mouse[0]-mouseprepos[0], win_y+mouse[1]-mouseprepos[1], WIDTH, HEIGHT, 64)
         win_x, win_y, _, _ = win32gui.GetWindowRect(HWND)
 
-    # 이전 프레임 데이터 보관처리
+    # 이전 프레임 데이터 보관 처리
     keyboardpre = keyboard
     mouseprepos = mouse
 
@@ -151,15 +148,31 @@ while not eventKey_quit:
 
     # 오디오 데이터 불러오기
     audio_data = importer.get_audio_data()
-    importer.importer()
     
     # 헤드룸 조정
-    if peak < max(abs(audio_data)) :
-        peak = max(abs(audio_data))
-        peak_pre = peak
+    peak_temp = max(abs(audio_data))
+    if peak - NOISEFLOOR <= peak_temp <= peak :
         peak_fresh = time.time()
-    elif time.time() - peak_fresh > PEAK_HOLD:
-        peak = max(max(abs(audio_data)), peak - peak/PEAK_REALESE/FPS)
+    elif peak < peak_temp :
+        peak = peak_temp
+        peak_fresh = time.time()
+    elif time.time() - peak_fresh > PEAK_HOLD :
+        peak = max(peak - peak/PEAK_REALESE/FPS, peak_temp)
+
+    # 오디오 데이터 정규화
+    audio_data = audio_data / peak
+
+    # 푸리에 변환
+    fft_data = np.abs(np.fft.fft(audio_data, n = RATE, norm = "ortho")[0 : RATE//2])
+
+    # 푸리에변환 데이터 노이즈 처리
+    repair_data = fft_data - np.mean(fft_data) - NOISEFLOOR/peak
+
+    # 음정 가중치 변환
+    tune_data = (repair_data[0 : 4000 : 1] * (repair_data[0 : 8000 : 2] + repair_data[0 : 12000 : 3] + repair_data[0 : 16000 : 4]) / 3 )[FREQ_MASK : ]
+
+    # 음정 가중치 데이터 저장
+    tune_data_list = np.insert(tune_data_list[ : -1], 0, tune_data, axis = 0)
 
     # 화면 구성
 
@@ -171,12 +184,22 @@ while not eventKey_quit:
         
         # 메인
 
+        # 음정 세로선
+        for i in range(0, 88, 12):
+            pygame.draw.line(screen, (100, 100, 100), [draw_tune_line_x[i], 100], [draw_tune_line_x[i], 350], 1)
+
         # 오디오 그래프
-        pygame.draw.lines(screen, (200, 200, 200), False, list(zip(draw_audio_x, np.around(-audio_data*GRAPH_AUDIO_CY/2/peak+GRAPH_AUDIO_Y+GRAPH_AUDIO_CY/2).astype(np.int16))), 1)
+        pygame.draw.lines(screen, (200, 200, 200), False, list(zip(draw_audio_x, np.around(-audio_data * GRAPH_AUDIO_CY / 2 + GRAPH_AUDIO_Y + GRAPH_AUDIO_CY / 2).astype(np.int16))), 1)
+
+        # 푸리에변환 그래프
+        pygame.draw.lines(screen, (200, 200, 200), False, list(zip(draw_fft_x, np.around(-fft_data * 50 + 300).astype(np.int16))), 1)
+
+        # 음정가중치 그래프
+        pygame.draw.lines(screen, (0, 255, 0), False, list(zip(draw_tune_x, np.around(-tune_data_list.mean(axis = 0) * 50 + 300).astype(np.int16))), 2)
 
         # 그래프 틀 
-        screen.blit(text[1], (GRAPH_AUDIO_X, GRAPH_AUDIO_Y - 35))
-        pygame.draw.rect(screen, (255, 255, 255), [GRAPH_AUDIO_X, GRAPH_AUDIO_Y, GRAPH_AUDIO_CX, GRAPH_AUDIO_CY], 2)
+        screen.blit(text["Audio_Signal"], (GRAPH_AUDIO_X, GRAPH_AUDIO_Y - 35))
+        pygame.draw.rect(screen, (255, 255, 255), [GRAPH_AUDIO_X, GRAPH_AUDIO_Y, GRAPH_AUDIO_CX, GRAPH_AUDIO_CY], 3)
 
     # 상태바
     pygame.draw.rect(screen, (10, 10, 10), [0, 0, WIDTH, 30], 0)
@@ -197,7 +220,7 @@ while not eventKey_quit:
     pygame.draw.line(screen, (255, 255, 255), [WIDTH-65, 20], [WIDTH-55, 20], 1) # _
     pygame.draw.line(screen, (255, 255, 255), [WIDTH-25, 10], [WIDTH-15, 20], 1) # X
     pygame.draw.line(screen, (255, 255, 255), [WIDTH-25, 20], [WIDTH-15, 10], 1) # X
-    screen.blit(text[0], (15, 5))
+    screen.blit(text["Melody_Catcher_title"], (15, 5))
 
     # 프레임 완성    
     pygame.display.update()

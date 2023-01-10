@@ -26,6 +26,7 @@ class audio_importer():
         return
 
     def get_audio_data(self):
+        self.importer()
         return np.array(audio_data)
 
     def get_audio_delay(self):
